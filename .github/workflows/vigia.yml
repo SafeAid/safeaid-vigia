@@ -1,0 +1,43 @@
+name: vigia
+# El canal RÁPIDO de SafeAid: cada ~10 minutos junta sismos (USGS+EMSC,
+# confirmación de doble red), desastres GDACS y alertas meteorológicas
+# oficiales del feed mundial de la OMM, y publica vigia.json.
+# Todo es de fuentes públicas: no hay secretos en este repo.
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vigia
+  cancel-in-progress: false
+
+jobs:
+  vigia:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Correr vigía
+        run: node run.mjs
+
+      - name: Publicar si cambió
+        run: |
+          git config user.name "safeaid-vigia"
+          git config user.email "javier@safeaid.io"
+          git add vigia.json
+          if git diff --cached --quiet; then
+            echo "sin cambios"
+          else
+            git commit -m "vigia $(date -u +%Y-%m-%dT%H:%MZ)"
+            git pull --rebase origin main || true
+            git push
+          fi

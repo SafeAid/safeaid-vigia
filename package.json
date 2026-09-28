@@ -1,0 +1,11 @@
+{
+  "name": "safeaid-vigia",
+  "private": true,
+  "type": "module",
+  "version": "1.0.0",
+  "description": "SafeAid fast channel: dual-network confirmed earthquakes (USGS+EMSC), GDACS disasters and official WMO meteorological alerts, refreshed every ~10 minutes.",
+  "scripts": {
+    "vigia": "node run.mjs"
+  },
+  "engines": { "node": ">=22" }
+}
