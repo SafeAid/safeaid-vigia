@@ -25,6 +25,7 @@ import { fileURLToPath } from 'node:url'
 import {
   parseUsgsGeojson, parseEmscFdsn, mergeQuakes, feltRadiusKm,
   parseGdacsEvents, disasterRadiusKm, parseWmoWarnings, wmoByCountry, parseSmnAlerts,
+  parseWmoWfs,
 } from './src/lib.mjs'
 
 dns.setDefaultResultOrder('ipv4first')
@@ -59,12 +60,19 @@ async function tryFetch(name, fn) {
 async function main() {
   const since = new Date(Date.now() - 24 * 3600_000).toISOString().slice(0, 19)
 
-  const [usgs, emsc, gdacs, wmo, smn] = await Promise.all([
+  // WFS de SWIC con el POLÍGONO de cada alerta (pedido de Javier: alertas por
+  // ciudad, no por país). Pesado (~27 MB), por eso timeout largo y tolerante.
+  const WFS_ZONAS = 'https://severeweather.wmo.int/f/wfs?request=GetFeature&version=1.1.0'
+    + '&typeName=local_postgis:postgis_geojsons'
+    + `&cql_filter=${encodeURIComponent("row_type='POLYGON'")}&outputFormat=json`
+
+  const [usgs, emsc, gdacs, wmo, smn, wfs] = await Promise.all([
     tryFetch('usgs', () => getJson('https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson')),
     tryFetch('emsc', () => getJson(`https://www.seismicportal.eu/fdsnws/event/1/query?format=json&limit=800&minmag=2.5&starttime=${since}`)),
     tryFetch('gdacs', () => getJson('https://www.gdacs.org/gdacsapi/api/events/geteventlist/EVENTS4APP')),
     tryFetch('wmo', () => getJson('https://severeweather.wmo.int/v2/json/wmo_all.json')),
     tryFetch('smn', () => getJson('https://ws.smn.gob.ar/alerts/type/AL')),
+    tryFetch('wmo-zonas', () => getJson(WFS_ZONAS, { timeoutMs: 120_000 })),
   ])
 
   const quakesAll = mergeQuakes(
@@ -79,7 +87,10 @@ async function main() {
   const disasters = (gdacs.ok ? parseGdacsEvents(gdacs.value) : [])
     .map((d) => ({ ...d, radius_km: disasterRadiusKm(d.type, d.level) }))
 
-  const wmoWarnings = wmo.ok ? parseWmoWarnings(wmo.value) : []
+  // Primaria: WFS (vigentes + polígono). Respaldo: wmo_all filtrado por
+  // vigencia (hallazgo 29-sep: es un archivo rodante lleno de vencidas).
+  const wmoWarnings = wfs.ok ? parseWmoWfs(wfs.value)
+    : wmo.ok ? parseWmoWarnings(wmo.value) : []
   const official = wmoByCountry(wmoWarnings)
   const smnAlerts = smn.ok ? parseSmnAlerts(smn.value) : []
 
@@ -113,6 +124,7 @@ async function main() {
     window_hours: 24,
     sources_ok: {
       usgs: usgs.ok, emsc: emsc.ok, gdacs: gdacs.ok, wmo: wmo.ok, smn: smn.ok,
+      wmo_zonas: wfs.ok,
       ...(smn.ok ? {} : { smn_error: smn.error }),
     },
     quakes,
@@ -125,7 +137,8 @@ async function main() {
   writeFileSync(`${OUT}.tmp`, JSON.stringify(out))
   renameSync(`${OUT}.tmp`, OUT)
   const kb = (JSON.stringify(out).length / 1024).toFixed(0)
-  log(`listo: ${quakes.length} sismos (${quakes.filter((q) => q.confirmed).length} confirmados) · ${disasters.length} desastres GDACS · ${wmoWarnings.length} alertas oficiales OMM en ${wmoCountries.size} países · ${smnAlerts.length} SMN → vigia.json (${kb} KB)`)
+  const conZonas = wmoWarnings.filter((w) => w.zones?.length).length
+  log(`listo: ${quakes.length} sismos (${quakes.filter((q) => q.confirmed).length} confirmados) · ${disasters.length} desastres GDACS · ${wmoWarnings.length} alertas oficiales OMM en ${wmoCountries.size} países (${conZonas} con zona) · ${smnAlerts.length} SMN → vigia.json (${kb} KB)`)
 }
 
 main().catch((e) => {

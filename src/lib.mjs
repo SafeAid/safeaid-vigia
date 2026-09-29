@@ -1,7 +1,5 @@
 // src/lib.mjs — núcleo PURO del vigía de eventos de SafeAid.
-// El vigía es el canal RÁPIDO (minutos) de la app: sismos confirmados por doble
-// red (USGS↔EMSC) + alertas oficiales. Copia standalone del motor principal
-// (repo privado); mantener en sincronía ante cambios de tolerancias o radios.
+// Copia standalone del motor principal (repo privado); mantener en sincronía.
 // Acá no hay red: parseo, matching y geometría, todo testeable.
 import { iso2to3 } from './iso.mjs';
 
@@ -21,7 +19,7 @@ export function haversineKm(lat1, lon1, lat2, lon2) {
  * agregadas y actualizadas al minuto. «El SMN de cada país» en una integración.
  * El país viene codificado como prefijo alpha-2 del campo url ("cn-cma-…").
  */
-export function parseWmoWarnings(json) {
+export function parseWmoWarnings(json, { now = Date.now() } = {}) {
   const out = [];
   for (const w of json?.items ?? []) {
     // El feed usa capURL en la mayoría de los ítems y url en algunos; el
@@ -29,6 +27,10 @@ export function parseWmoWarnings(json) {
     const iso2 = /^([a-z]{2})-/i.exec(w.capURL ?? w.url ?? '')?.[1];
     const iso3 = iso2to3(iso2);
     if (!iso3 || !w.event) continue;
+    // HALLAZGO 29-sep: wmo_all.json es un archivo RODANTE — trae alertas ya
+    // vencidas (las 73 de AR estaban todas caducas). Sin filtro de vigencia,
+    // este parser miente «vigentes». Es el RESPALDO del WFS (parseWmoWfs).
+    if (w.expires && !isExpiryValid(w.expires, now)) continue;
     out.push({
       id: `wmo:${w.id}`,
       source: 'wmo',
@@ -41,6 +43,98 @@ export function parseWmoWarnings(json) {
     });
   }
   return out;
+}
+
+/** «2026-09-10 17:59:59» o ISO → ¿sigue vigente a `now`? (sin fecha = vigente) */
+function isExpiryValid(expires, now) {
+  const t = Date.parse(String(expires).replace(' ', 'T') + (/[zZ]|[+-]\d\d:?\d\d$/.test(String(expires)) ? '' : 'Z'));
+  return Number.isNaN(t) ? true : t > now;
+}
+
+// ------------------------------------------------------------- zonas por alerta
+// Pedido de Javier (29-sep): «ubicación y alertas por ciudad, no por país».
+// El WFS de SWIC (local_postgis:postgis_geojsons, row_type='POLYGON') publica
+// el polígono real de cada alerta, casable por capurl. Acá se simplifica a
+// nivel ciudad (~2 km) para que el JSON siga siendo liviano y el TELÉFONO
+// decida si el punto del usuario cae adentro — la ubicación no viaja nunca.
+
+/** Redondea a la grilla, borra vértices repetidos y adelgaza a maxPoints. */
+export function simplifyRing(ring, { grid = 0.02, maxPoints = 60 } = {}) {
+  const out = [];
+  let prev = null;
+  for (const p of ring) {
+    if (!Array.isArray(p) || p.length < 2) continue;
+    const lng = Math.round(Math.round(p[0] / grid) * grid * 100) / 100;
+    const lat = Math.round(Math.round(p[1] / grid) * grid * 100) / 100;
+    if (!prev || lng !== prev[0] || lat !== prev[1]) { prev = [lng, lat]; out.push(prev); }
+  }
+  if (out.length <= maxPoints) return out;
+  const paso = Math.ceil(out.length / maxPoints);
+  const fino = out.filter((_, i) => i % paso === 0);
+  const ultimo = out[out.length - 1];
+  if (fino[fino.length - 1] !== ultimo) fino.push(ultimo);
+  return fino;
+}
+
+/** [oeste, sur, este, norte] del anillo ORIGINAL (prefiltro sin pérdida). */
+export function bboxOfRing(ring) {
+  let w = Infinity, s = Infinity, e = -Infinity, n = -Infinity;
+  for (const p of ring) {
+    if (!Array.isArray(p) || p.length < 2) continue;
+    if (p[0] < w) w = p[0];
+    if (p[0] > e) e = p[0];
+    if (p[1] < s) s = p[1];
+    if (p[1] > n) n = p[1];
+  }
+  const r = (v) => Math.round(v * 100) / 100;
+  return [r(w), r(s), r(e), r(n)];
+}
+
+/**
+ * FUENTE PRIMARIA de alertas oficiales: el WFS de SWIC
+ * (local_postgis:postgis_geojsons, row_type='POLYGON') — solo lo VIGENTE y con
+ * el polígono real de cada alerta. Una alerta (capurl) puede venir en varias
+ * features (una por área): acá se agrupan en un solo item con `zones`.
+ */
+export function parseWmoWfs(wfsJson, { now = Date.now(), maxZonesPerAlert = 4, maxPoints = 60 } = {}) {
+  const byCap = new Map();
+  for (const f of wfsJson?.features ?? []) {
+    const p = f?.properties ?? {};
+    const cap = p.capurl;
+    if (!cap) continue;
+    const iso3 = iso2to3(/^([a-z]{2})-/i.exec(cap)?.[1]);
+    if (!iso3 || !p.event) continue;
+    if (p.expires && !isExpiryValid(p.expires, now)) continue;
+    let alerta = byCap.get(cap);
+    if (!alerta) {
+      alerta = {
+        id: `wmo:${cap}`,
+        source: 'wmo',
+        iso3,
+        event: String(p.event),
+        headline: p.headline ? String(p.headline).slice(0, 160) : String(p.event),
+        area: p.areadesc ? String(p.areadesc).slice(0, 120) : null,
+        sent: p.sent ?? null,
+        onset: p.onset ?? null,
+        expires: p.expires ?? null,
+        zones: [],
+      };
+      byCap.set(cap, alerta);
+    }
+    const g = f.geometry;
+    const polys = g?.type === 'Polygon' ? [g.coordinates]
+      : g?.type === 'MultiPolygon' ? g.coordinates : [];
+    for (const coords of polys) {
+      const outer = coords?.[0];
+      if (!Array.isArray(outer) || outer.length < 4) continue;
+      if (alerta.zones.length >= maxZonesPerAlert) break;
+      const ring = simplifyRing(outer, { maxPoints });
+      if (ring.length < 3) continue;
+      alerta.zones.push({ bbox: bboxOfRing(outer), ring });
+    }
+  }
+  // Sin zona útil la alerta vale igual (queda a nivel país, declarada).
+  return [...byCap.values()].map((a) => (a.zones.length ? a : { ...a, zones: undefined }));
 }
 
 /** Agrupa las alertas OMM por país: { ISO3: { count, events:[tipos], items:[…máx N] } } */
